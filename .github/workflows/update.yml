@@ -1,0 +1,689 @@
+# Fantasy ยังไงดี: builds the leaderboard site from FPL and publishes it on GitHub Pages.
+# Everything it needs is in this one file.
+name: Update leaderboard
+
+on:
+  schedule:
+    - cron: "17 1,13 * * *"   # every day at 08:17 and 20:17 Bangkok time
+  workflow_dispatch:           # "Run workflow" button for an update right now
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Keep FPL data from earlier runs
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: fpl-${{ github.run_id }}
+          restore-keys: fpl-
+
+      - name: Install the preview-image tool
+        run: pip install playwright==1.48.0
+
+      - name: Write the scripts
+        run: |
+          mkdir -p scripts
+          cat > scripts/fetch.py <<'SCRIPTEOF'
+          """Fetch FPL league data: game status, league standings and each team's gameweek history.
+          Usage: python3 fetch.py <data_dir> <league_id>
+          Picks and live points (only needed to break a tie) are fetched later by compute.py, on demand."""
+          import json, os, sys, time, urllib.request
+
+          data_dir, league_id = sys.argv[1], sys.argv[2]
+          BASE = "https://fantasy.premierleague.com/api"
+
+
+          def get(path, cache):
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request(BASE + path, headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          d = json.loads(r.read())
+                      break
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                      time.sleep(3 * (attempt + 1))
+              json.dump(d, open(os.path.join(data_dir, cache), "w"))
+              time.sleep(0.15)
+              return d
+
+
+          os.makedirs(os.path.join(data_dir, "hist"), exist_ok=True)
+          boot = get("/bootstrap-static/", "bootstrap.json")
+          league = get(f"/leagues-classic/{league_id}/standings/", "league.json")
+          entries = [r["entry"] for r in league["standings"]["results"]]
+          for eid in entries:
+              get(f"/entry/{eid}/history/", f"hist/{eid}.json")
+          finished = [e["id"] for e in boot["events"] if e["finished"] and e["data_checked"]]
+          print("entries", len(entries), "finished GWs", finished)
+          SCRIPTEOF
+          cat > scripts/compute.py <<'SCRIPTEOF'
+          """Compute league prizes per the group's rules. Usage: python3 -I compute.py <data_dir> <out_json>"""
+          import json, os, sys
+
+          data_dir, out = sys.argv[1], sys.argv[2]
+          FEE = 3000
+          SEASON_PCT = [18, 10, 7, 6, 5, 4]
+          WEEK_PCT, HALF_PCT, GWMAX_PCT, IMPROVE_PCT = 1, 3, 3, 3
+
+          L = lambda p: json.load(open(os.path.join(data_dir, p)))
+          boot, league = L("bootstrap.json"), L("league.json")
+          finished = [e["id"] for e in boot["events"] if e["finished"] and e["data_checked"]]
+          current_gw = max(finished)
+          members = [{"entry": r["entry"], "team": r["entry_name"], "manager": r["player_name"].strip()}
+                     for r in league["standings"]["results"]]
+          ids = [m["entry"] for m in members]
+          pot = FEE * len(members)
+          pct = lambda p: pot * p / 100
+
+          # net points per GW (gross points minus transfer hits)
+          net, total = {}, {}
+          for eid in ids:
+              h = L(f"hist/{eid}.json")["current"]
+              net[eid] = {r["event"]: r["points"] - r["event_transfers_cost"] for r in h}
+              total[eid] = h[-1]["total_points"] if h else 0
+              assert sum(net[eid].values()) == total[eid], eid
+
+          def cached(path, cache):
+              """Picks and live points of a finished GW never change, so they are fetched once and kept."""
+              fn = os.path.join(data_dir, cache)
+              if os.path.exists(fn):
+                  return json.load(open(fn))
+              import time, urllib.request
+              os.makedirs(os.path.dirname(fn), exist_ok=True)
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request("https://fantasy.premierleague.com/api" + path,
+                                                   headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          d = json.loads(r.read())
+                      break
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                      time.sleep(3 * (attempt + 1))
+              json.dump(d, open(fn, "w"))
+              return d
+
+          _live = {}
+          def live_points(gw):
+              if gw not in _live:
+                  _live[gw] = {e["id"]: e["stats"]["total_points"]
+                               for e in cached(f"/event/{gw}/live/", f"live/{gw}.json")["elements"]}
+              return _live[gw]
+
+          def tiebreak(eid, gw):
+              """Weekly tie-break order: all 15 players' points, captain, vice-captain, goalkeeper."""
+              p = cached(f"/entry/{eid}/event/{gw}/picks/", f"picks/{eid}_{gw}.json")
+              lp = live_points(gw)
+              picks = p["picks"]
+              all15 = sum(lp.get(x["element"], 0) for x in picks)
+              cap = next(x["element"] for x in picks if x["is_captain"])
+              vc = next(x["element"] for x in picks if x["is_vice_captain"])
+              xi = [x["element"] for x in picks if x["position"] <= 11]
+              for s in p.get("automatic_subs", []):
+                  if s["element_out"] in xi:
+                      xi[xi.index(s["element_out"])] = s["element_in"]
+              gk = next(x["element"] for x in picks if x["element"] in xi and x["element_type"] == 1)
+              return [all15, lp.get(cap, 0), lp.get(vc, 0), lp.get(gk, 0)]
+
+          won = {eid: 0.0 for eid in ids}
+          weeks = []
+          for gw in finished:
+              scores = {eid: net[eid].get(gw, 0) for eid in ids}
+              top = max(scores.values())
+              tied = [eid for eid in ids if scores[eid] == top]
+              tb = None
+              if len(tied) > 1:
+                  tb = {eid: tiebreak(eid, gw) for eid in tied}
+                  best = max(tb.values())
+                  winners = [eid for eid in tied if tb[eid] == best]
+              else:
+                  winners = tied
+              for w in winners:
+                  won[w] += pct(WEEK_PCT) / len(winners)
+              weeks.append({"gw": gw, "scores": scores, "top": top, "tied": tied,
+                            "tiebreak": tb, "winners": winners})
+
+          def leaders(vals):
+              best = max(vals.values())
+              return [k for k, v in vals.items() if v == best], best
+
+          # season ranking: total, then H2H from latest GW backwards
+          order = sorted(ids, key=lambda e: [total[e]] + [net[e].get(g, 0) for g in sorted(finished, reverse=True)], reverse=True)
+          season = [{"entry": e, "rank": i + 1, "total": total[e],
+                     "projected": pct(SEASON_PCT[i]) if i < len(SEASON_PCT) else 0} for i, e in enumerate(order)]
+
+          h1 = {e: sum(v for g, v in net[e].items() if g <= 19) for e in ids}
+          h2 = {e: sum(v for g, v in net[e].items() if g >= 20) for e in ids}
+          gwmax = {e: max(net[e].values()) for e in ids}
+          h1_lead, h1_best = leaders(h1)
+          gm_lead, gm_best = leaders(gwmax)
+          gm_when = {e: [g for g, v in net[e].items() if v == gm_best] for e in gm_lead}
+
+          result = {
+              "league": league["league"]["name"], "league_id": league["league"]["id"],
+              "current_gw": current_gw, "next_gw": current_gw + 1, "fee": FEE, "pot": pot,
+              "members": members, "net": {str(e): net[e] for e in ids}, "total": {str(e): total[e] for e in ids},
+              "weeks": weeks, "weekly_won": {str(e): won[e] for e in ids},
+              "season": season,
+              "half1": {"scores": {str(e): h1[e] for e in ids}, "leaders": h1_lead, "best": h1_best, "prize": pct(HALF_PCT)},
+              "half2": {"scores": {str(e): h2[e] for e in ids}, "prize": pct(HALF_PCT), "started": current_gw >= 20},
+              "gwmax": {"scores": {str(e): gwmax[e] for e in ids}, "leaders": gm_lead, "best": gm_best,
+                        "when": {str(k): v for k, v in gm_when.items()}, "prize": pct(GWMAX_PCT)},
+              "improve": {"prize": pct(IMPROVE_PCT), "started": current_gw >= 20},
+              "pct_check": sum(SEASON_PCT) + 38 * WEEK_PCT + 2 * HALF_PCT + GWMAX_PCT + IMPROVE_PCT,
+          }
+          json.dump(result, open(out, "w"), ensure_ascii=False, indent=1)
+
+          name = {m["entry"]: m["manager"] for m in members}
+          print("pot", pot, "pct total", result["pct_check"], "GW", current_gw)
+          for w in weeks:
+              print(f"GW{w['gw']:2d} top {w['top']:3d} tied {[name[t] for t in w['tied']]} tb {w['tiebreak']} -> {[name[x] for x in w['winners']]}")
+          print("half1 leaders", [name[x] for x in h1_lead], h1_best)
+          print("gwmax", [name[x] for x in gm_lead], gm_best, gm_when)
+          for s in season:
+              print(s["rank"], name[s["entry"]], s["total"], s["projected"], "weekly won", won[s["entry"]])
+          SCRIPTEOF
+          cat > scripts/make_files.py <<'SCRIPTEOF'
+          """Turn league_data.json (from compute.py) into the dashboard's data files.
+          Usage: python3 -I make_files.py <league_data.json> <scripts_dir> <out_dir>
+          Each file is {rows, meta}; meta carries the code that made it."""
+          import json, os, sys
+
+          src, scripts_dir, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+          d = json.load(open(src))
+          os.makedirs(out_dir, exist_ok=True)
+
+          SEASON_PCT = [18, 10, 7, 6, 5, 4]
+          pot = d["pot"]
+          cur = d["current_gw"]
+          mem = {m["entry"]: m for m in d["members"]}
+          name = lambda e: mem[e]["manager"]
+          fmt_names = lambda es: ", ".join(name(e) for e in es)
+
+          code = [{"label": fn, "value": open(os.path.join(scripts_dir, fn)).read(), "type": "code", "lang": "python"}
+                  for fn in ("fetch.py", "compute.py", "make_files.py")]
+          meta = code + [{"label": "Input", "value": f"FPL API, classic league {d['league_id']}, GW1–{cur}"}]
+
+          # ---- special awards (projected leaders, split on ties) ----
+          award_share = {e: 0.0 for e in mem}
+          awards = []
+          for i, s in enumerate(d["season"][:6]):
+              awards.append({"id": f"season{i+1}", "kind": "season", "name": f"อันดับ {i+1} จบฤดูกาล", "pct": SEASON_PCT[i],
+                             "baht": pot * SEASON_PCT[i] / 100, "leader": name(s["entry"]), "value": s["total"],
+                             "detail": f"{s['total']} แต้ม", "status": "ตัดสินแล้ว" if cur >= 38 else "ถ้าจบวันนี้"})
+
+          def special(aid, title, leaders, value, detail, status):
+              prize = pot * 3 / 100
+              for e in leaders:
+                  award_share[e] += prize / len(leaders)
+              awards.append({"id": aid, "kind": "special", "name": title, "pct": 3, "baht": prize,
+                             "leader": fmt_names(leaders) if leaders else None, "value": value,
+                             "detail": detail, "status": status})
+
+          h1, h2 = d["half1"], d["half2"]
+          special("half1", "แชมป์ครึ่งฤดูกาลแรก (GW1–19)", h1["leaders"], h1["best"],
+                  f"{h1['best']} แต้ม" + (" (แบ่งกัน)" if len(h1["leaders"]) > 1 else ""),
+                  "ตัดสินแล้ว" if cur >= 19 else "นำอยู่")
+
+          if cur >= 20:
+              s2 = {int(k): v for k, v in h2["scores"].items()}
+              best = max(s2.values()); lead2 = [e for e, v in s2.items() if v == best]
+              special("half2", "แชมป์ครึ่งฤดูกาลหลัง (GW20–38)", lead2, best, f"{best} แต้ม",
+                      "ตัดสินแล้ว" if cur >= 38 else "นำอยู่")
+              s1 = {int(k): v for k, v in h1["scores"].items()}
+              n2 = cur - 19
+              # until GW38 the halves have different lengths, so compare per-GW averages
+              imp = {e: (s2[e] / n2 - s1[e] / 19) if cur < 38 else (s2[e] - s1[e]) for e in s1}
+              bi = max(imp.values()); lead_i = [e for e, v in imp.items() if abs(v - bi) < 1e-9]
+              special("improve", "พัฒนาการดีที่สุด (19 วีกหลัง − 19 วีกแรก)", lead_i, round(bi, 1),
+                      (f"+{bi:.0f} แต้ม" if cur >= 38 else f"+{bi:.1f} แต้ม/วีก (เทียบค่าเฉลี่ย)"),
+                      "ตัดสินแล้ว" if cur >= 38 else "นำอยู่")
+          else:
+              special("half2", "แชมป์ครึ่งฤดูกาลหลัง (GW20–38)", [], None, "เริ่มนับ GW20", "ยังไม่เริ่ม")
+              special("improve", "พัฒนาการดีที่สุด (19 วีกหลัง − 19 วีกแรก)", [], None, "เริ่มวัดหลัง GW20", "ยังไม่เริ่ม")
+
+          gm = d["gwmax"]
+          gm_detail = ", ".join(f"GW{g}" for e in gm["leaders"] for g in gm["when"][str(e)])
+          special("gwmax", "แต้มสูงสุดใน 1 วีกของฤดูกาล", gm["leaders"], gm["best"], f"{gm['best']} แต้ม ({gm_detail})",
+                  "ตัดสินแล้ว" if cur >= 38 else "นำอยู่")
+
+          # ---- weekly winners (newest first) ----
+          weekly = []
+          for w in sorted(d["weeks"], key=lambda w: -w["gw"]):
+              split = len(w["winners"])
+              note = ""
+              if len(w["tied"]) > 1:
+                  note = "เสมอ " + fmt_names(w["tied"]) + " → ตัดสินด้วย 15 ตัว/กัปตัน/รองกัปตัน/GK"
+                  if split > 1:
+                      note += " ยังเท่ากัน แบ่งรางวัล"
+              weekly.append({"gw": w["gw"], "winner": fmt_names(w["winners"]),
+                             "team": ", ".join(mem[e]["team"] for e in w["winners"]),
+                             "winner_entry": ",".join(str(e) for e in w["winners"]),
+                             "points": w["top"], "baht": pot / 100, "note": note or None})
+
+          # ---- standings ----
+          weekly_won = {int(k): v for k, v in d["weekly_won"].items()}
+          wins = {e: 0.0 for e in mem}
+          for w in d["weeks"]:
+              for e in w["winners"]:
+                  wins[e] += 1 / len(w["winners"])
+          leader_total = d["season"][0]["total"]
+          standings = []
+          for s in d["season"]:
+              e = s["entry"]
+              proj = weekly_won[e] + s["projected"] + award_share[e]
+              standings.append({"rank": s["rank"], "entry": e, "team": mem[e]["team"], "manager": mem[e]["manager"],
+                                "total": s["total"], "gap": s["total"] - leader_total,
+                                "gw_points": d["net"][str(e)].get(str(cur), 0),
+                                "weekly_wins": round(wins[e], 2), "weekly_baht": weekly_won[e],
+                                "season_baht": s["projected"], "award_baht": award_share[e],
+                                "projected_baht": proj, "gw": cur})
+
+          # ---- points per GW, wide (one column per GW) ----
+          scores = []
+          for s in d["season"]:
+              e = s["entry"]
+              row = {"entry": e, "manager": mem[e]["manager"], "team": mem[e]["team"]}
+              for g in range(1, cur + 1):
+                  row[f"GW{g}"] = d["net"][str(e)].get(str(g), 0)
+              scores.append(row)
+
+          for fn, rows in [("standings", standings), ("weekly", weekly), ("awards", awards), ("scores", scores)]:
+              json.dump({"rows": rows, "meta": meta}, open(os.path.join(out_dir, fn + ".json"), "w"), ensure_ascii=False)
+          assert abs(sum(a["pct"] for a in awards) + 38 - 100) < 1e-9
+          print("projected payout", sum(r["projected_baht"] for r in standings), "of pot", pot)
+          for r in standings:
+              print(r["rank"], r["manager"], r["total"], r["gap"], r["weekly_baht"], r["season_baht"], r["award_baht"], r["projected_baht"])
+          SCRIPTEOF
+          cat > scripts/build_site.py <<'SCRIPTEOF'
+          """Render the league's standalone website (no Claude needed to view it).
+          Usage: python3 build_site.py <files_dir> <out_dir>
+          Reads standings/weekly/awards/scores.json made by make_files.py and writes index.html."""
+          import json, os, sys
+          from html import escape as E
+
+          files_dir, out_dir = sys.argv[1], sys.argv[2]
+          os.makedirs(out_dir, exist_ok=True)
+          R = lambda n: json.load(open(os.path.join(files_dir, n + ".json")))["rows"]
+          standings, weekly, awards, scores = R("standings"), R("weekly"), R("awards"), R("scores")
+
+          FEE = 3000
+          SITE_URL = os.environ.get("SITE_URL", "")  # full site address, so LINE can load the preview image
+          members = len(standings)
+          pot = members * FEE
+          gw = max(r["gw"] for r in standings)
+          paid = sum(r["baht"] for r in weekly)
+          standings.sort(key=lambda r: r["rank"])
+          leader = standings[0]
+          lead = leader["total"] - standings[1]["total"] if members > 1 else 0
+
+          def n(v):
+              if v is None:
+                  return "—"
+              return f"{v:,.0f}" if float(v).is_integer() else f"{v:,.1f}"
+
+          def badge(rank):
+              cls = f" r{rank}" if rank <= 3 else ""
+              return f'<span class="rank{cls}">{rank}</span>'
+
+          # ---- leaderboard ----
+          rows_html = []
+          for r in standings:
+              gap = "" if r["gap"] == 0 else f'<span class="chip">ห่าง <b>{n(r["gap"])}</b></span>'
+              rows_html.append(f"""
+          <li class="row{' money' if r['rank'] <= 6 else ''}">
+            {badge(r['rank'])}
+            <div class="who"><span class="team">{E(r['team'])}</span><span class="mgr">{E(r['manager'])}</span></div>
+            <div class="pts"><span class="pts-num">{n(r['total'])}</span><span class="pts-lbl">แต้ม</span></div>
+            <div class="meta">
+              <span class="chip">GW{gw} <b>{n(r['gw_points'])}</b></span>{gap}
+              <span class="chip c-money">ได้แล้ว <b>{n(r['weekly_baht'])}</b> ฿</span>
+              <span class="chip c-proj">ถ้าจบวันนี้ <b>{n(r['projected_baht'])}</b> ฿</span>
+            </div>
+          </li>""")
+              if r["rank"] == 6 and members > 6:
+                  rows_html.append('<li class="cut" aria-hidden="true">เส้นรับเงินจบฤดูกาล · Top 6</li>')
+
+          # ---- weekly winners ----
+          weeks_html = []
+          for i, w in enumerate(sorted(weekly, key=lambda w: -w["gw"])):
+              note = f'<span class="w-note">{E(w["note"])}</span>' if w.get("note") else ""
+              weeks_html.append(f"""
+          <li class="week{' latest' if i == 0 else ''}">
+            <span class="w-gw">GW{w['gw']}</span>
+            <span class="w-name">{E(w['winner'])}</span>
+            <span class="w-team">{E(w['team'])}</span>
+            <span class="w-pts">{n(w['points'])} <small>แต้ม</small></span>
+            <span class="w-baht">+{n(w['baht'])} บาท</span>{note}
+          </li>""")
+
+          # ---- special awards ----
+          STATUS = {"นำอยู่": "lead", "ถ้าจบวันนี้": "lead", "ตัดสินแล้ว": "done"}
+          order = ["half1", "half2", "gwmax", "improve"]
+          awards_html = []
+          for a in sorted([a for a in awards if a["kind"] == "special"], key=lambda a: order.index(a["id"])):
+              awards_html.append(f"""
+          <div class="award">
+            <div class="a-top"><span class="a-name">{E(a['name'])}</span><span class="pill {STATUS.get(a['status'], '')}">{E(a['status'])}</span></div>
+            <div class="a-baht">{n(a['baht'])} <small>บาท ({n(a['pct'])}%)</small></div>
+            <div class="a-leader">{E(a['leader'] or '—')}</div>
+            <div class="a-detail">{E(a['detail'] or '')}</div>
+          </div>""")
+
+          # ---- season prizes ----
+          prizes_html = []
+          for i, a in enumerate(sorted([a for a in awards if a["kind"] == "season"], key=lambda a: -a["pct"])):
+              prizes_html.append(f"""
+          <li class="prize">
+            {badge(i + 1)}
+            <div class="who"><span class="team">{E(a['leader'] or '—')}</span><span class="mgr">{n(a['value'])} แต้ม · {n(a['pct'])}% ของกองกลาง</span></div>
+            <div class="p-baht">{n(a['baht'])}<small>บาท</small></div>
+          </li>""")
+
+          # ---- heatmap ----
+          cols = sorted([c for c in scores[0] if c.startswith("GW")], key=lambda c: int(c[2:]))
+          win = {f"GW{w['gw']}": str(w["winner_entry"]).split(",") for w in weekly}
+          ext = {c: (min(r[c] for r in scores), max(r[c] for r in scores)) for c in cols}
+          head = '<th class="h-name">ทีม</th>' + "".join(f"<th>{c}</th>" for c in cols)
+          body = []
+          for r in scores:
+              cells = []
+              for c in cols:
+                  lo, hi = ext[c]
+                  t = (r[c] - lo) / (hi - lo) if hi > lo else 1
+                  w = " win" if str(r["entry"]) in win.get(c, []) else ""
+                  cells.append(f'<td class="{w.strip()}" style="--t:{0.05 + 0.61 * t:.3f}">{n(r[c])}</td>')
+              body.append(f'<tr><td class="h-name">{E(r["team"])}</td>{"".join(cells)}</tr>')
+
+          latest = max(weekly, key=lambda w: w["gw"]) if weekly else None
+          og_desc = f"หลัง GW{gw}: {leader['team']} นำ {leader['total']} แต้ม · กองกลาง {pot:,} บาท"
+
+          html = f"""<!doctype html>
+          <html lang="th">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+          <title>Fantasy ยังไงดี · ตารางคะแนน</title>
+          <meta name="description" content="{E(og_desc)}">
+          <meta property="og:title" content="Fantasy ยังไงดี · ตารางคะแนน GW{gw}">
+          <meta property="og:description" content="{E(og_desc)}">
+          <meta property="og:type" content="website">
+          <meta property="og:image" content="{E(SITE_URL)}og.png">
+          <meta property="og:url" content="{E(SITE_URL)}">
+          <meta name="theme-color" content="#37003c">
+          <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%BD%3C/text%3E%3C/svg%3E">
+          <link rel="preconnect" href="https://fonts.googleapis.com">
+          <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+          <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@500;600;700&family=Noto+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+          <style>
+          :root{{--bg:#f6f4f8;--panel:#ffffff;--line:#e7e2ec;--fg:#1d1424;--muted:#6f6578;--green:#00a85a;--pink:#e90052;--chip:#f3f0f6}}
+          @media (prefers-color-scheme:dark){{:root{{--bg:#120a16;--panel:#1d1323;--line:#2f2338;--fg:#f4eef7;--muted:#a597ae;--green:#22d482;--chip:#261a2d}}}}
+          *{{box-sizing:border-box}}
+          html{{-webkit-text-size-adjust:100%}}
+          body{{margin:0;background:var(--bg);color:var(--fg);font-family:"Noto Sans Thai",system-ui,-apple-system,sans-serif;line-height:1.45}}
+          .wrap{{max-width:760px;margin:0 auto;padding:16px 16px 40px;display:flex;flex-direction:column;gap:28px}}
+          h1,h2,.pts-num,.k-num,.w-pts,.a-baht,.p-baht{{font-family:"Kanit","Noto Sans Thai",sans-serif}}
+          .hero{{position:relative;overflow:hidden;border-radius:24px;padding:22px 20px 20px;color:#fff;background:radial-gradient(120% 140% at 100% 0%,rgba(233,0,82,.55),rgba(233,0,82,0) 55%),radial-gradient(90% 120% at 0% 100%,rgba(0,255,133,.18),rgba(0,255,133,0) 60%),linear-gradient(150deg,#22002a,#37003c 50%,#4b0a5a)}}
+          .hero:before{{content:"";position:absolute;right:-70px;top:-70px;width:230px;height:230px;border:2px solid rgba(255,255,255,.08);border-radius:50%}}
+          .hero>*{{position:relative}}
+          .h-top{{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}}
+          .tag{{font-size:11px;letter-spacing:.08em;text-transform:uppercase;background:rgba(0,255,133,.16);color:#00ff85;padding:4px 10px;border-radius:999px;font-weight:700}}
+          .h-gw{{font-size:12px;color:rgba(255,255,255,.75)}}
+          h1{{font-size:34px;line-height:1.1;margin:14px 0 8px;font-weight:700}}
+          .lede{{margin:0 0 18px;color:rgba(255,255,255,.88);font-size:15px}}
+          .lede b{{color:#00ff85}}
+          .kpis{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
+          .kpi{{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.13);border-radius:16px;padding:12px 14px;display:flex;flex-direction:column;gap:2px;min-width:0}}
+          .kpi.big{{grid-column:1/-1;background:rgba(0,255,133,.10);border-color:rgba(0,255,133,.35)}}
+          .k-lbl{{font-size:12px;color:rgba(255,255,255,.72)}}
+          .k-num{{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.2}}
+          .big .k-num{{font-size:38px;color:#00ff85}}
+          .k-num small{{font-size:13px;font-weight:500;opacity:.75}}
+          .k-sub{{font-size:12px;color:rgba(255,255,255,.65)}}
+          h2{{font-size:21px;font-weight:600;margin:0 0 2px}}
+          .sub{{color:var(--muted);font-size:13px;margin:0 0 14px}}
+          ol{{list-style:none;margin:0;padding:0}}
+          .board,.prizes{{display:flex;flex-direction:column;gap:8px}}
+          .row{{display:grid;grid-template-columns:36px minmax(0,1fr) auto;grid-template-areas:"rank who pts" "rank meta meta";column-gap:12px;row-gap:8px;align-items:center;padding:12px 14px;background:var(--panel);border:1px solid var(--line);border-radius:16px}}
+          .row.money{{box-shadow:inset 4px 0 0 var(--green)}}
+          .rank{{grid-area:rank;align-self:start;width:34px;height:34px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:14px;background:var(--chip);border:1px solid var(--line);font-variant-numeric:tabular-nums}}
+          .rank.r1{{background:linear-gradient(145deg,#ffe58a,#d4a017);color:#3b2a00;border:0;box-shadow:0 2px 10px rgba(212,160,23,.45)}}
+          .rank.r2{{background:linear-gradient(145deg,#f4f6f8,#a3acb5);color:#22272c;border:0}}
+          .rank.r3{{background:linear-gradient(145deg,#f6c9a1,#b4703a);color:#3a1d06;border:0}}
+          .who{{grid-area:who;min-width:0;display:flex;flex-direction:column}}
+          .team{{font-weight:700;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+          .mgr{{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+          .pts{{grid-area:pts;display:flex;flex-direction:column;align-items:flex-end}}
+          .pts-num{{font-size:25px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}}
+          .pts-lbl{{font-size:11px;color:var(--muted)}}
+          .meta{{grid-area:meta;display:flex;flex-wrap:wrap;gap:6px}}
+          .chip{{font-size:12px;padding:3px 9px;border-radius:999px;background:var(--chip);border:1px solid var(--line);color:var(--muted);white-space:nowrap}}
+          .chip b{{color:var(--fg);font-variant-numeric:tabular-nums}}
+          .c-money{{background:rgba(0,201,107,.12);border-color:rgba(0,201,107,.4)}}
+          .c-proj{{background:rgba(233,0,82,.09);border-color:rgba(233,0,82,.35)}}
+          .cut{{display:flex;align-items:center;gap:10px;font-size:11px;font-weight:700;color:var(--green);margin:4px 0}}
+          .cut:before,.cut:after{{content:"";flex:1;height:1px;background:currentColor;opacity:.45}}
+          .note{{font-size:12px;color:var(--muted);margin:10px 2px 0}}
+          .weeks{{display:flex;gap:10px;overflow-x:auto;scroll-snap-type:x mandatory;padding:2px 2px 10px;-webkit-overflow-scrolling:touch}}
+          .week{{flex:0 0 152px;scroll-snap-align:start;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px 13px;display:flex;flex-direction:column;gap:1px;min-width:0}}
+          .w-gw{{font-size:12px;font-weight:700;color:var(--pink);letter-spacing:.04em}}
+          .w-name{{font-weight:700;font-size:14px;margin-top:4px;overflow-wrap:anywhere}}
+          .w-team{{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+          .w-pts{{font-size:24px;font-weight:700;margin-top:8px;line-height:1.1}}
+          .w-pts small{{font-size:12px;font-weight:500;color:var(--muted);font-family:"Noto Sans Thai",sans-serif}}
+          .w-baht{{font-size:12px;font-weight:700;color:var(--green)}}
+          .w-note{{font-size:11px;color:var(--muted);margin-top:4px}}
+          .week.latest{{background:linear-gradient(160deg,#37003c,#5d0f6e);border-color:transparent;color:#fff}}
+          .week.latest .w-gw,.week.latest .w-baht{{color:#00ff85}}
+          .week.latest .w-team,.week.latest .w-pts small,.week.latest .w-note{{color:rgba(255,255,255,.72)}}
+          .awards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}}
+          .award{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:4px}}
+          .a-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}}
+          .a-name{{font-weight:700;font-size:14px}}
+          .pill{{font-size:11px;padding:2px 9px;border-radius:999px;white-space:nowrap;font-weight:700;background:var(--chip);color:var(--muted);border:1px solid var(--line)}}
+          .pill.lead{{background:rgba(0,201,107,.14);color:var(--green);border-color:rgba(0,201,107,.4)}}
+          .pill.done{{background:rgba(212,160,23,.16);color:#c9960c;border-color:rgba(212,160,23,.45)}}
+          .a-baht{{font-size:23px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}}
+          .a-baht small{{font-size:12px;font-weight:500;color:var(--muted);font-family:"Noto Sans Thai",sans-serif}}
+          .a-leader{{font-size:14px;font-weight:600}}
+          .a-detail{{font-size:12px;color:var(--muted)}}
+          .prize{{display:grid;grid-template-columns:36px minmax(0,1fr) auto;column-gap:12px;align-items:center;padding:10px 14px;background:var(--panel);border:1px solid var(--line);border-radius:16px}}
+          .prize .rank,.prize .who{{grid-area:auto}}
+          .prize .rank{{align-self:center}}
+          .p-baht{{display:flex;flex-direction:column;align-items:flex-end;font-weight:700;font-size:19px;font-variant-numeric:tabular-nums;line-height:1.1}}
+          .p-baht small{{font-size:11px;font-weight:500;color:var(--muted);font-family:"Noto Sans Thai",sans-serif}}
+          .heat-wrap{{overflow-x:auto;border:1px solid var(--line);border-radius:16px;background:var(--panel);-webkit-overflow-scrolling:touch}}
+          table{{border-collapse:separate;border-spacing:0;font-size:12px;font-variant-numeric:tabular-nums;min-width:100%}}
+          th,td{{padding:7px 9px;text-align:center;white-space:nowrap}}
+          thead th{{font-weight:700;color:var(--muted);border-bottom:1px solid var(--line)}}
+          td{{background:rgba(0,201,107,var(--t))}}
+          .h-name{{position:sticky;left:0;z-index:1;background:var(--panel);text-align:left;font-weight:700;max-width:130px;overflow:hidden;text-overflow:ellipsis;border-right:1px solid var(--line)}}
+          td.win{{box-shadow:inset 0 0 0 2px var(--pink);font-weight:800;border-radius:8px}}
+          .legend{{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--muted);margin:10px 2px 0}}
+          .sw{{display:inline-block;width:12px;height:12px;border-radius:4px;vertical-align:-2px;margin-right:5px}}
+          details{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:12px 16px}}
+          summary{{cursor:pointer;font-weight:700}}
+          details ul{{margin:10px 0 4px;padding-left:20px;font-size:13px}}
+          details li{{margin:3px 0}}
+          .foot{{font-size:12px;color:var(--muted);text-align:center;margin:-8px 0 0}}
+          </style>
+          </head>
+          <body>
+          <main class="wrap">
+            <section class="hero">
+              <div class="h-top"><span class="tag">Fantasy Premier League</span><span class="h-gw">อัปเดตหลังจบ <b>GW{gw}</b></span></div>
+              <h1>Fantasy ยังไงดี</h1>
+              <p class="lede"><b>{E(leader['team'])}</b> นำจ่าฝูงด้วย <b>{n(leader['total'])}</b> แต้ม ทิ้งอันดับ 2 อยู่ <b>{n(lead)}</b> แต้ม</p>
+              <div class="kpis">
+                <div class="kpi big"><span class="k-lbl">💰 กองกลางทั้งหมด</span><span class="k-num">{n(pot)} <small>บาท</small></span><span class="k-sub">{members} คน × {n(FEE)} บาท</span></div>
+                <div class="kpi"><span class="k-lbl">จ่ายรางวัลรายวีกแล้ว</span><span class="k-num">{n(paid)} <small>บาท</small></span><span class="k-sub">รวม {len(weekly)} วีก</span></div>
+                <div class="kpi"><span class="k-lbl">วีกถัดไป</span><span class="k-num">GW{min(gw + 1, 38)}</span><span class="k-sub">เหลืออีก {38 - gw} วีก</span></div>
+              </div>
+            </section>
+
+            <section>
+              <h2>🏆 ตารางคะแนน</h2>
+              <p class="sub">แถบเขียว = อยู่ในโซนรับเงินจบฤดูกาล (Top 6)</p>
+              <ol class="board">{''.join(rows_html)}</ol>
+              <p class="note">“ได้แล้ว” = รางวัลรายวีกที่ชนะไปแล้ว · “ถ้าจบวันนี้” = ได้แล้ว + เงินตามอันดับตอนนี้ + รางวัลพิเศษที่กำลังนำอยู่</p>
+            </section>
+
+            <section>
+              <h2>🔥 แชมป์ประจำวีก</h2>
+              <p class="sub">แต้มสุทธิสูงสุดของวีก (หักค่า transfer แล้ว) รับ 1% ของกองกลาง · ปัดดูวีกก่อนหน้าได้</p>
+              <ol class="weeks">{''.join(weeks_html)}</ol>
+            </section>
+
+            <section>
+              <h2>⭐ รางวัลพิเศษ</h2>
+              <p class="sub">รางวัลละ 3% ของกองกลาง · ถ้าแต้มเท่ากันหารกัน</p>
+              <div class="awards">{''.join(awards_html)}</div>
+            </section>
+
+            <section>
+              <h2>🥇 เงินรางวัลจบฤดูกาล</h2>
+              <p class="sub">ใครจะได้ถ้าฤดูกาลจบวันนี้</p>
+              <ol class="prizes">{''.join(prizes_html)}</ol>
+            </section>
+
+            <section>
+              <h2>📊 แต้มรายวีก</h2>
+              <p class="sub">แต้มสุทธิของทุกคนในแต่ละวีก · ปัดซ้ายขวาได้</p>
+              <div class="heat-wrap"><table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>
+              <div class="legend"><span><i class="sw" style="background:rgba(0,201,107,.66)"></i>สีเข้ม = แต้มสูงในวีกนั้น</span><span><i class="sw" style="box-shadow:inset 0 0 0 2px #e90052"></i>กรอบชมพู = แชมป์ประจำวีก</span></div>
+            </section>
+
+            <details>
+              <summary>📜 กติกาและวิธีคิดเงินรางวัล</summary>
+              <ul>
+                <li>ค่าสมัครคนละ 3,000 บาท กองกลาง 100% = 3,000 × จำนวนสมาชิก</li>
+                <li>จบฤดูกาล: อันดับ 1 18% · อันดับ 2 10% · อันดับ 3 7% · อันดับ 4 6% · อันดับ 5 5% · อันดับ 6 4%</li>
+                <li>แต้มสูงสุดประจำวีก (net หัก transfer แล้ว) รับ 1% ต่อวีก (38 วีก = 38%)</li>
+                <li>แชมป์ครึ่งฤดูกาลแรก (GW1–19) 3% · แชมป์ครึ่งฤดูกาลหลัง (GW20–38) 3%</li>
+                <li>แต้มสูงสุดใน 1 วีกของฤดูกาล 3% · พัฒนาการดีที่สุด (แต้ม 19 วีกหลัง − 19 วีกแรก) 3%</li>
+                <li>แชมป์ประจำวีกแต้มเท่ากัน: ดูแต้ม 15 ตัว → แต้มกัปตัน → แต้มรองกัปตัน → แต้ม GK</li>
+                <li>รางวัลพิเศษ 4 รางวัล ถ้าแต้มเท่ากันให้หารกัน</li>
+                <li>อันดับจบฤดูกาลแต้มเท่ากัน: ดูแต้ม GW38 → GW37 ไล่ย้อนไปเรื่อยๆ</li>
+                <li>ระหว่างฤดูกาลหลัง (ก่อนจบ GW38) รางวัลพัฒนาการเทียบจากแต้มเฉลี่ยต่อวีก เพราะจำนวนวีกยังไม่เท่ากัน</li>
+              </ul>
+            </details>
+            <p class="foot">ข้อมูลจาก Fantasy Premier League · อัปเดตหลังจบแต่ละ Gameweek</p>
+          </main>
+          </body>
+          </html>
+          """
+          open(os.path.join(out_dir, "index.html"), "w").write(html)
+
+          # small card image for the link preview in LINE
+          og = f"""<!doctype html><html><head><meta charset="utf-8">
+          <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@500;700&family=Noto+Sans+Thai:wght@500;700&display=swap" rel="stylesheet">
+          <style>body{{margin:0;width:1200px;height:630px;font-family:"Kanit","Noto Sans Thai",sans-serif;color:#fff;
+          background:radial-gradient(120% 140% at 100% 0%,rgba(233,0,82,.6),rgba(233,0,82,0) 55%),radial-gradient(90% 120% at 0% 100%,rgba(0,255,133,.22),rgba(0,255,133,0) 60%),linear-gradient(150deg,#22002a,#37003c 50%,#4b0a5a);
+          display:flex;flex-direction:column;justify-content:center;padding:0 80px;box-sizing:border-box}}
+          .t{{font-size:26px;letter-spacing:.1em;color:#00ff85;text-transform:uppercase}}h1{{font-size:96px;margin:6px 0 10px;line-height:1}}
+          p{{font-size:40px;margin:0;color:rgba(255,255,255,.9)}}b{{color:#00ff85}}.pot{{margin-top:34px;font-size:34px;color:rgba(255,255,255,.75)}}</style></head>
+          <body><div class="t">⚽ Fantasy Premier League · GW{gw}</div><h1>Fantasy ยังไงดี</h1>
+          <p><b>{E(leader['team'])}</b> นำจ่าฝูง {n(leader['total'])} แต้ม</p><div class="pot">กองกลาง <b>{n(pot)}</b> บาท · {members} คน</div></body></html>"""
+          open(os.path.join(out_dir, "og.html"), "w").write(og)
+          print("built", os.path.join(out_dir, "index.html"))
+          SCRIPTEOF
+          cat > scripts/og.py <<'SCRIPTEOF'
+          """Turn og.html into og.png, the picture LINE shows under the link.
+          Usage: python3 og.py <site_dir>
+          A failure here only means no preview picture, so it never stops the site from updating."""
+          import os, sys
+
+          site = os.path.abspath(sys.argv[1])
+          try:
+              from playwright.sync_api import sync_playwright
+              chrome = next((p for p in ("/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser")
+                             if os.path.exists(p)), None)
+              with sync_playwright() as p:
+                  b = p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+                  pg = b.new_page(viewport={"width": 1200, "height": 630})
+                  pg.goto(f"file://{site}/og.html")
+                  pg.wait_for_timeout(2000)
+                  pg.screenshot(path=os.path.join(site, "og.png"))
+                  b.close()
+              print("og.png written")
+          except Exception as e:  # noqa: BLE001
+              print("skipped og.png:", e)
+          finally:
+              if os.path.exists(os.path.join(site, "og.html")):
+                  os.remove(os.path.join(site, "og.html"))
+          SCRIPTEOF
+          cat > scripts/run.sh <<'SCRIPTEOF'
+          #!/usr/bin/env bash
+          # Rebuild the leaderboard site from live FPL data.
+          # LEAGUE_ID: the FPL classic league. SITE_URL: the site's address (for the LINE preview image).
+          set -euo pipefail
+          cd "$(dirname "$0")/.."
+          LEAGUE_ID="${LEAGUE_ID:-315129}"
+          CACHE=.cache
+          OUT=_site
+
+          mkdir -p "$CACHE" "$OUT/data"
+          python3 scripts/fetch.py "$CACHE" "$LEAGUE_ID"
+          python3 scripts/compute.py "$CACHE" "$CACHE/league_data.json"
+          python3 scripts/make_files.py "$CACHE/league_data.json" scripts "$OUT/data"
+          python3 scripts/build_site.py "$OUT/data" "$OUT"
+          python3 scripts/og.py "$OUT"
+          touch "$OUT/.nojekyll"
+
+          # Keep a copy of the numbers in the repo, so each gameweek's result stays in its history.
+          mkdir -p data
+          cp "$OUT"/data/*.json data/
+          SCRIPTEOF
+
+      - name: Build the site from FPL
+        run: bash scripts/run.sh
+        env:
+          LEAGUE_ID: "315129"
+          SITE_URL: "https://jingjuuuuuuuuu.github.io/Fantasy-YungNgaiDee/"
+
+      - name: Save this gameweek's numbers in the repo
+        run: |
+          git config user.name "leaderboard-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if ! git diff --cached --quiet; then
+            GW=$(python3 -c "import json;print(json.load(open('data/standings.json'))['rows'][0]['gw'])")
+            git commit -m "Update standings after GW${GW}"
+            git push
+          fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
