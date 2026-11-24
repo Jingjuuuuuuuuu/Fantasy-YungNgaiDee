@@ -103,6 +103,15 @@ jobs:
               total[eid] = h[-1]["total_points"] if h else 0
               assert sum(net[eid].values()) == total[eid], eid
 
+          # A gameweek whose matches have started but that FPL has not closed yet (finished + data_checked).
+          # Its points already count in the totals, so the site shows it as provisional;
+          # its weekly prize waits until FPL closes it.
+          cur_ev = next((e for e in boot["events"] if e["is_current"]), None)
+          provisional_gw = None
+          if cur_ev and cur_ev["id"] > current_gw and any(net[e].get(cur_ev["id"], 0) for e in ids):
+              provisional_gw = cur_ev["id"]
+          show_gw = provisional_gw or current_gw
+
           def cached(path, cache):
               """Picks and live points of a finished GW never change, so they are fetched once and kept."""
               fn = os.path.join(data_dir, cache)
@@ -183,6 +192,7 @@ jobs:
           result = {
               "league": league["league"]["name"], "league_id": league["league"]["id"],
               "current_gw": current_gw, "next_gw": current_gw + 1, "fee": FEE, "pot": pot,
+              "show_gw": show_gw, "provisional_gw": provisional_gw,
               "members": members, "net": {str(e): net[e] for e in ids}, "total": {str(e): total[e] for e in ids},
               "weeks": weeks, "weekly_won": {str(e): won[e] for e in ids},
               "season": season,
@@ -196,7 +206,7 @@ jobs:
           json.dump(result, open(out, "w"), ensure_ascii=False, indent=1)
 
           name = {m["entry"]: m["manager"] for m in members}
-          print("pot", pot, "pct total", result["pct_check"], "GW", current_gw)
+          print("pot", pot, "pct total", result["pct_check"], "GW", current_gw, "provisional GW", provisional_gw)
           for w in weeks:
               print(f"GW{w['gw']:2d} top {w['top']:3d} tied {[name[t] for t in w['tied']]} tb {w['tiebreak']} -> {[name[x] for x in w['winners']]}")
           print("half1 leaders", [name[x] for x in h1_lead], h1_best)
@@ -216,14 +226,17 @@ jobs:
 
           SEASON_PCT = [18, 10, 7, 6, 5, 4]
           pot = d["pot"]
-          cur = d["current_gw"]
+          cur = d["current_gw"]                  # last GW that FPL has closed (prizes go by this)
+          show = d.get("show_gw") or cur         # GW the site shows: the in-progress one, if any
+          prov = d.get("provisional_gw")
           mem = {m["entry"]: m for m in d["members"]}
           name = lambda e: mem[e]["manager"]
           fmt_names = lambda es: ", ".join(name(e) for e in es)
 
           code = [{"label": fn, "value": open(os.path.join(scripts_dir, fn)).read(), "type": "code", "lang": "python"}
                   for fn in ("fetch.py", "compute.py", "make_files.py")]
-          meta = code + [{"label": "Input", "value": f"FPL API, classic league {d['league_id']}, GW1–{cur}"}]
+          meta = code + [{"label": "Input", "value": f"FPL API, classic league {d['league_id']}, GW1–{show}"
+                                                     + (f" (GW{prov} provisional)" if prov else "")}]
 
           # ---- special awards (projected leaders, split on ties) ----
           award_share = {e: 0.0 for e in mem}
@@ -295,17 +308,18 @@ jobs:
               proj = weekly_won[e] + s["projected"] + award_share[e]
               standings.append({"rank": s["rank"], "entry": e, "team": mem[e]["team"], "manager": mem[e]["manager"],
                                 "total": s["total"], "gap": s["total"] - leader_total,
-                                "gw_points": d["net"][str(e)].get(str(cur), 0),
+                                "gw_points": d["net"][str(e)].get(str(show), 0),
                                 "weekly_wins": round(wins[e], 2), "weekly_baht": weekly_won[e],
                                 "season_baht": s["projected"], "award_baht": award_share[e],
-                                "projected_baht": proj, "gw": cur})
+                                "projected_baht": proj, "gw": show,
+                                "provisional": bool(prov), "final_gw": cur})
 
           # ---- points per GW, wide (one column per GW) ----
           scores = []
           for s in d["season"]:
               e = s["entry"]
               row = {"entry": e, "manager": mem[e]["manager"], "team": mem[e]["team"]}
-              for g in range(1, cur + 1):
+              for g in range(1, show + 1):
                   row[f"GW{g}"] = d["net"][str(e)].get(str(g), 0)
               scores.append(row)
 
@@ -333,6 +347,9 @@ jobs:
           members = len(standings)
           pot = members * FEE
           gw = max(r["gw"] for r in standings)
+          # provisional: FPL has not closed this GW yet, so its points can still change and its weekly prize waits
+          prov = any(r.get("provisional") for r in standings)
+          gw_tag = f"GW{gw} ชั่วคราว" if prov else f"GW{gw}"
           paid = sum(r["baht"] for r in weekly)
           standings.sort(key=lambda r: r["rank"])
           leader = standings[0]
@@ -357,7 +374,7 @@ jobs:
             <div class="who"><span class="team">{E(r['team'])}</span><span class="mgr">{E(r['manager'])}</span></div>
             <div class="pts"><span class="pts-num">{n(r['total'])}</span><span class="pts-lbl">แต้ม</span></div>
             <div class="meta">
-              <span class="chip">GW{gw} <b>{n(r['gw_points'])}</b></span>{gap}
+              <span class="chip">{gw_tag} <b>{n(r['gw_points'])}</b></span>{gap}
               <span class="chip c-money">ได้แล้ว <b>{n(r['weekly_baht'])}</b> ฿</span>
               <span class="chip c-proj">ถ้าจบวันนี้ <b>{n(r['projected_baht'])}</b> ฿</span>
             </div>
@@ -376,6 +393,20 @@ jobs:
             <span class="w-team">{E(w['team'])}</span>
             <span class="w-pts">{n(w['points'])} <small>แต้ม</small></span>
             <span class="w-baht">+{n(w['baht'])} บาท</span>{note}
+          </li>""")
+
+          # the GW FPL has not closed yet: show who is ahead, but no prize until it is final
+          if prov:
+              col = f"GW{gw}"
+              top = max(r[col] for r in scores)
+              ahead = [r for r in scores if r[col] == top]
+              weeks_html.insert(0, f"""
+          <li class="week pending">
+            <span class="w-gw">GW{gw} · รอ FPL ปิดวีก</span>
+            <span class="w-name">{E(", ".join(r["manager"] for r in ahead))}</span>
+            <span class="w-team">{E(", ".join(r["team"] for r in ahead))}</span>
+            <span class="w-pts">{n(top)} <small>แต้ม</small></span>
+            <span class="w-baht">นำอยู่ · ยังไม่ตัดสิน</span>
           </li>""")
 
           # ---- special awards ----
@@ -405,7 +436,8 @@ jobs:
           cols = sorted([c for c in scores[0] if c.startswith("GW")], key=lambda c: int(c[2:]))
           win = {f"GW{w['gw']}": str(w["winner_entry"]).split(",") for w in weekly}
           ext = {c: (min(r[c] for r in scores), max(r[c] for r in scores)) for c in cols}
-          head = '<th class="h-name">ทีม</th>' + "".join(f"<th>{c}</th>" for c in cols)
+          head = '<th class="h-name">ทีม</th>' + "".join(
+              f"<th>{c}*</th>" if prov and c == f"GW{gw}" else f"<th>{c}</th>" for c in cols)
           body = []
           for r in scores:
               cells = []
@@ -417,7 +449,10 @@ jobs:
               body.append(f'<tr><td class="h-name">{E(r["team"])}</td>{"".join(cells)}</tr>')
 
           latest = max(weekly, key=lambda w: w["gw"]) if weekly else None
-          og_desc = f"หลัง GW{gw}: {leader['team']} นำ {leader['total']} แต้ม · กองกลาง {pot:,} บาท"
+          og_desc = (f"GW{gw} (แต้มชั่วคราว)" if prov else f"หลัง GW{gw}") + f": {leader['team']} นำ {leader['total']} แต้ม · กองกลาง {pot:,} บาท"
+          hero_gw = f"<b>GW{gw}</b> · แต้มชั่วคราว รอ FPL ยืนยัน" if prov else f"อัปเดตหลังจบ <b>GW{gw}</b>"
+          prov_note = (f'<p class="prov-note">แต้ม GW{gw} ยังเป็นแต้มชั่วคราว รอ FPL ยืนยัน (อาจขยับได้เล็กน้อย) · '
+                       f'แต้มรวมและอันดับนับ GW{gw} แล้ว · แชมป์ประจำวีก GW{gw} จะประกาศเมื่อ FPL ปิดวีก</p>') if prov else ""
 
           html = f"""<!doctype html>
           <html lang="th">
@@ -426,7 +461,7 @@ jobs:
           <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
           <title>Fantasy ยังไงดี · ตารางคะแนน</title>
           <meta name="description" content="{E(og_desc)}">
-          <meta property="og:title" content="Fantasy ยังไงดี · ตารางคะแนน GW{gw}">
+          <meta property="og:title" content="Fantasy ยังไงดี · ตารางคะแนน {gw_tag}">
           <meta property="og:description" content="{E(og_desc)}">
           <meta property="og:type" content="website">
           <meta property="og:image" content="{E(SITE_URL)}og.png">
@@ -497,6 +532,9 @@ jobs:
           .week.latest{{background:linear-gradient(160deg,#37003c,#5d0f6e);border-color:transparent;color:#fff}}
           .week.latest .w-gw,.week.latest .w-baht{{color:#00ff85}}
           .week.latest .w-team,.week.latest .w-pts small,.week.latest .w-note{{color:rgba(255,255,255,.72)}}
+          .week.pending{{border-style:dashed}}
+          .week.pending .w-baht{{color:var(--muted)}}
+          .prov-note{{font-size:12px;margin:0 0 12px;padding:8px 12px;border-radius:12px;background:rgba(233,0,82,.08);border:1px dashed rgba(233,0,82,.4)}}
           .awards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}}
           .award{{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:4px}}
           .a-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}}
@@ -532,7 +570,7 @@ jobs:
           <body>
           <main class="wrap">
             <section class="hero">
-              <div class="h-top"><span class="tag">Fantasy Premier League</span><span class="h-gw">อัปเดตหลังจบ <b>GW{gw}</b></span></div>
+              <div class="h-top"><span class="tag">Fantasy Premier League</span><span class="h-gw">{hero_gw}</span></div>
               <h1>Fantasy ยังไงดี</h1>
               <p class="lede"><b>{E(leader['team'])}</b> นำจ่าฝูงด้วย <b>{n(leader['total'])}</b> แต้ม ทิ้งอันดับ 2 อยู่ <b>{n(lead)}</b> แต้ม</p>
               <div class="kpis">
@@ -545,7 +583,7 @@ jobs:
             <section>
               <h2>🏆 ตารางคะแนน</h2>
               <p class="sub">แถบเขียว = อยู่ในโซนรับเงินจบฤดูกาล (Top 6)</p>
-              <ol class="board">{''.join(rows_html)}</ol>
+              {prov_note}<ol class="board">{''.join(rows_html)}</ol>
               <p class="note">“ได้แล้ว” = รางวัลรายวีกที่ชนะไปแล้ว · “ถ้าจบวันนี้” = ได้แล้ว + เงินตามอันดับตอนนี้ + รางวัลพิเศษที่กำลังนำอยู่</p>
             </section>
 
@@ -571,7 +609,7 @@ jobs:
               <h2>📊 แต้มรายวีก</h2>
               <p class="sub">แต้มสุทธิของทุกคนในแต่ละวีก · ปัดซ้ายขวาได้</p>
               <div class="heat-wrap"><table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>
-              <div class="legend"><span><i class="sw" style="background:rgba(0,201,107,.66)"></i>สีเข้ม = แต้มสูงในวีกนั้น</span><span><i class="sw" style="box-shadow:inset 0 0 0 2px #e90052"></i>กรอบชมพู = แชมป์ประจำวีก</span></div>
+              <div class="legend"><span><i class="sw" style="background:rgba(0,201,107,.66)"></i>สีเข้ม = แต้มสูงในวีกนั้น</span><span><i class="sw" style="box-shadow:inset 0 0 0 2px #e90052"></i>กรอบชมพู = แชมป์ประจำวีก</span>{f'<span>GW{gw}* = แต้มชั่วคราว</span>' if prov else ''}</div>
             </section>
 
             <details>
@@ -603,7 +641,7 @@ jobs:
           display:flex;flex-direction:column;justify-content:center;padding:0 80px;box-sizing:border-box}}
           .t{{font-size:26px;letter-spacing:.1em;color:#00ff85;text-transform:uppercase}}h1{{font-size:96px;margin:6px 0 10px;line-height:1}}
           p{{font-size:40px;margin:0;color:rgba(255,255,255,.9)}}b{{color:#00ff85}}.pot{{margin-top:34px;font-size:34px;color:rgba(255,255,255,.75)}}</style></head>
-          <body><div class="t">⚽ Fantasy Premier League · GW{gw}</div><h1>Fantasy ยังไงดี</h1>
+          <body><div class="t">⚽ Fantasy Premier League · {gw_tag}</div><h1>Fantasy ยังไงดี</h1>
           <p><b>{E(leader['team'])}</b> นำจ่าฝูง {n(leader['total'])} แต้ม</p><div class="pot">กองกลาง <b>{n(pot)}</b> บาท · {members} คน</div></body></html>"""
           open(os.path.join(out_dir, "og.html"), "w").write(og)
           print("built", os.path.join(out_dir, "index.html"))
@@ -669,7 +707,12 @@ jobs:
           git add data
           if ! git diff --cached --quiet; then
             GW=$(python3 -c "import json;print(json.load(open('data/standings.json'))['rows'][0]['gw'])")
-            git commit -m "Update standings after GW${GW}"
+            PROV=$(python3 -c "import json;print('yes' if json.load(open('data/standings.json'))['rows'][0].get('provisional') else '')")
+            if [ -n "$PROV" ]; then
+              git commit -m "Update standings: GW${GW} provisional"
+            else
+              git commit -m "Update standings after GW${GW}"
+            fi
             git push
           fi
 
