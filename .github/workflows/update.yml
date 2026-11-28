@@ -4,7 +4,8 @@ name: Update leaderboard
 
 on:
   schedule:
-    - cron: "17 1,13 * * *"   # every day at 08:17 and 20:17 Bangkok time
+    - cron: "17 1 * * *"       # every morning at 08:17 Bangkok time
+    - cron: "17 11-23 * * *"   # every hour 18:17–06:17 Bangkok time, when Premier League matches are played
   workflow_dispatch:           # "Run workflow" button for an update right now
   push:
     branches: [main]
