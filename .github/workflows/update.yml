@@ -104,13 +104,95 @@ jobs:
               total[eid] = h[-1]["total_points"] if h else 0
               assert sum(net[eid].values()) == total[eid], eid
 
+          def fresh(path):
+              """Fetch from FPL without caching (live data changes during matches)."""
+              import time, urllib.request
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request("https://fantasy.premierleague.com/api" + path,
+                                                   headers={"User-Agent": "Mozilla/5.0"})
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          return json.loads(r.read())
+                  except Exception:
+                      if attempt == 3:
+                          raise
+                      time.sleep(3 * (attempt + 1))
+
+          def live_gw_points(gw):
+              """Each team's net points in GW gw right now, worked out the way the FPL app shows them live:
+              live player points, captain (or vice-captain if the captain did not play), chips,
+              automatic substitutions once a starter's matches are over, minus transfer hits.
+              FPL only copies points into each team's history once a match day is processed, so this is fresher."""
+              live = {el["id"]: el["stats"] for el in fresh(f"/event/{gw}/live/")["elements"]}
+              team = {p["id"]: p["team"] for p in boot["elements"]}
+              left = {}  # matches each club still has to finish in this GW
+              for f in fresh(f"/fixtures/?event={gw}"):
+                  over = f["finished"] or f["finished_provisional"]
+                  for t in (f["team_h"], f["team_a"]):
+                      left[t] = left.get(t, 0) + (0 if over else 1)
+              pts = lambda el: live.get(el, {}).get("total_points", 0)
+              mins = lambda el: live.get(el, {}).get("minutes", 0)
+              out_for_good = lambda el: mins(el) == 0 and left.get(team[el], 0) == 0  # did not play, nothing left
+
+              def valid(xi):
+                  c = [sum(1 for x in xi if x["element_type"] == t) for t in (1, 2, 3, 4)]
+                  return c[0] == 1 and c[1] >= 3 and c[2] >= 2 and c[3] >= 1
+
+              res = {}
+              for eid in ids:
+                  p = fresh(f"/entry/{eid}/event/{gw}/picks/")
+                  picks = sorted(p["picks"], key=lambda x: x["position"])
+                  chip = p.get("active_chip")
+                  hit = (p.get("entry_history") or {}).get("event_transfers_cost", 0)
+                  if chip == "bboost":
+                      xi = list(picks)
+                  else:
+                      xi, bench = picks[:11], picks[11:]
+                      for i, s in enumerate(list(xi)):
+                          if not out_for_good(s["element"]):
+                              continue
+                          for b in bench:
+                              if mins(b["element"]) == 0:
+                                  continue
+                              if (s["element_type"] == 1) != (b["element_type"] == 1):
+                                  continue
+                              trial = xi[:i] + [b] + xi[i + 1:]
+                              if valid(trial):
+                                  xi = trial
+                                  bench.remove(b)
+                                  break
+                  cap = next(x for x in picks if x["is_captain"])
+                  vc = next((x for x in picks if x["is_vice_captain"]), None)
+                  times = 3 if chip == "3xc" else 2
+                  in_xi = {x["element"] for x in xi}
+                  armband = cap["element"]
+                  if out_for_good(cap["element"]) and vc and vc["element"] in in_xi:
+                      armband = vc["element"]
+                  total_pts = sum(pts(x["element"]) for x in xi)
+                  if armband in in_xi:
+                      total_pts += (times - 1) * pts(armband)
+                  res[eid] = total_pts - hit
+              return res
+
           # A gameweek whose matches have started but that FPL has not closed yet (finished + data_checked).
-          # Its points already count in the totals, so the site shows it as provisional;
+          # Its points count in the totals, so the site shows it as provisional (live while matches are on);
           # its weekly prize waits until FPL closes it.
           cur_ev = next((e for e in boot["events"] if e["is_current"]), None)
           provisional_gw = None
-          if cur_ev and cur_ev["id"] > current_gw and any(net[e].get(cur_ev["id"], 0) for e in ids):
-              provisional_gw = cur_ev["id"]
+          live_gw = None
+          if cur_ev and cur_ev["id"] > current_gw:
+              g = cur_ev["id"]
+              if not cur_ev["finished"]:
+                  try:
+                      lp = live_gw_points(g)
+                      for e in ids:
+                          net[e][g] = lp[e]
+                          total[e] = sum(net[e].values())
+                      live_gw = g
+                  except Exception as ex:  # live points are a nice-to-have; FPL's history numbers still work
+                      print("live points skipped:", ex)
+              if any(net[e].get(g, 0) for e in ids):
+                  provisional_gw = g
           show_gw = provisional_gw or current_gw
 
           def cached(path, cache):
@@ -193,7 +275,7 @@ jobs:
           result = {
               "league": league["league"]["name"], "league_id": league["league"]["id"],
               "current_gw": current_gw, "next_gw": current_gw + 1, "fee": FEE, "pot": pot,
-              "show_gw": show_gw, "provisional_gw": provisional_gw,
+              "show_gw": show_gw, "provisional_gw": provisional_gw, "live_gw": live_gw,
               "members": members, "net": {str(e): net[e] for e in ids}, "total": {str(e): total[e] for e in ids},
               "weeks": weeks, "weekly_won": {str(e): won[e] for e in ids},
               "season": season,
@@ -313,7 +395,8 @@ jobs:
                                 "weekly_wins": round(wins[e], 2), "weekly_baht": weekly_won[e],
                                 "season_baht": s["projected"], "award_baht": award_share[e],
                                 "projected_baht": proj, "gw": show,
-                                "provisional": bool(prov), "final_gw": cur})
+                                "provisional": bool(prov), "live": bool(prov and d.get("live_gw") == prov),
+                                "final_gw": cur})
 
           # ---- points per GW, wide (one column per GW) ----
           scores = []
@@ -451,8 +534,20 @@ jobs:
 
           latest = max(weekly, key=lambda w: w["gw"]) if weekly else None
           og_desc = (f"GW{gw} (แต้มชั่วคราว)" if prov else f"หลัง GW{gw}") + f": {leader['team']} นำ {leader['total']} แต้ม · กองกลาง {pot:,} บาท"
-          hero_gw = f"<b>GW{gw}</b> · แต้มชั่วคราว รอ FPL ยืนยัน" if prov else f"อัปเดตหลังจบ <b>GW{gw}</b>"
-          prov_note = (f'<p class="prov-note">แต้ม GW{gw} ยังเป็นแต้มชั่วคราว รอ FPL ยืนยัน (อาจขยับได้เล็กน้อย) · '
+          live = any(r.get("live") for r in standings)
+          from datetime import datetime, timedelta, timezone
+          now = datetime.now(timezone(timedelta(hours=7)))  # Bangkok time
+          TH_MON = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+          stamp = f"อัปเดต {now.day} {TH_MON[now.month - 1]} {now:%H:%M} น."
+          if prov and live:
+              hero_gw = f"<b>GW{gw}</b> · แต้มสด · {stamp}"
+          elif prov:
+              hero_gw = f"<b>GW{gw}</b> · แต้มชั่วคราว รอ FPL ยืนยัน · {stamp}"
+          else:
+              hero_gw = f"จบ <b>GW{gw}</b> · {stamp}"
+          how = ("คิดสดจากนัดที่แข่งไปแล้ว โบนัสจะเข้าหลัง FPL ยืนยันประจำวัน" if live
+                 else "ยังเป็นแต้มชั่วคราว รอ FPL ยืนยัน (อาจขยับได้เล็กน้อย)")
+          prov_note = (f'<p class="prov-note">แต้ม GW{gw} {how} · '
                        f'แต้มรวมและอันดับนับ GW{gw} แล้ว · แชมป์ประจำวีก GW{gw} จะประกาศเมื่อ FPL ปิดวีก</p>') if prov else ""
 
           html = f"""<!doctype html>
@@ -627,7 +722,7 @@ jobs:
                 <li>ระหว่างฤดูกาลหลัง (ก่อนจบ GW38) รางวัลพัฒนาการเทียบจากแต้มเฉลี่ยต่อวีก เพราะจำนวนวีกยังไม่เท่ากัน</li>
               </ul>
             </details>
-            <p class="foot">ข้อมูลจาก Fantasy Premier League · อัปเดตหลังจบแต่ละ Gameweek</p>
+            <p class="foot">ข้อมูลจาก Fantasy Premier League · อัปเดตทุกชั่วโมงช่วง 18:17–06:17 และ 08:17 ทุกวัน</p>
           </main>
           </body>
           </html>
